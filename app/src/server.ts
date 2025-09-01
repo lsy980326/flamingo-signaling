@@ -1,103 +1,164 @@
-import { Server, Socket } from "socket.io";
-import jwt from "jsonwebtoken";
+import { WebSocketServer, WebSocket } from "ws";
+import http from "http";
+import { URL } from "url";
+import * as map from "lib0/map";
+import * as jwt from "jsonwebtoken";
+import dotenv from "dotenv";
 
-// --- 1. Socket.IO 서버 생성 ---
-const io = new Server({
-  // 특정 경로를 사용하지 않고 루트('/')에서 모든 연결을 받음
-  // Nginx에서 /socket.io/ 경로를 자동으로 처리해 줌
-  cors: {
-    origin: "*", // 실제 운영 환경에서는 프론트엔드 도메인으로 제한하는 것이 안전
-    methods: ["GET", "POST"],
-  },
-  allowEIO3: true, // y-webrtc 구버전 클라이언트 호환성
+dotenv.config();
+
+const wsReadyStateConnecting = 0;
+const wsReadyStateOpen = 1;
+const pingTimeout = 30000;
+
+const PORT = process.env.PORT || 8081;
+// topics: key는 room 이름(topic), value는 해당 room에 있는 WebSocket 클라이언트 Set
+const topics = new Map<string, Set<WebSocket>>();
+
+const server = http.createServer((request, response) => {
+  response.writeHead(200, { "Content-Type": "text/plain" });
+  response.end("okay");
 });
 
-// --- 2. JWT 인증 미들웨어 ---
-io.use((socket: Socket, next: (err?: Error) => void) => {
+const wss = new WebSocketServer({ noServer: true });
+
+const send = (conn: WebSocket, message: object) => {
+  if (
+    conn.readyState !== wsReadyStateConnecting &&
+    conn.readyState !== wsReadyStateOpen
+  ) {
+    conn.close();
+  }
   try {
-    // y-webrtc는 쿼리 파라미터로 인증 정보를 보내므로, query에서 토큰을 찾음
-    const token = socket.handshake.query.token as string;
+    conn.send(JSON.stringify(message));
+  } catch (e) {
+    conn.close();
+  }
+};
+
+wss.on("connection", (conn: WebSocket, req) => {
+  console.log(`[Connection] User connected: ${(conn as any).user.email}`);
+  const subscribedTopics = new Set<string>();
+  let closed = false;
+
+  let pongReceived = true;
+  const pingInterval = setInterval(() => {
+    if (!pongReceived) {
+      conn.close();
+      clearInterval(pingInterval);
+    } else {
+      pongReceived = false;
+      try {
+        conn.ping();
+      } catch (e) {
+        conn.close();
+      }
+    }
+  }, pingTimeout);
+
+  conn.on("pong", () => {
+    pongReceived = true;
+  });
+
+  conn.on("close", () => {
+    subscribedTopics.forEach((topicName) => {
+      const subs = topics.get(topicName) || new Set();
+      subs.delete(conn);
+      if (subs.size === 0) {
+        topics.delete(topicName);
+      }
+    });
+    subscribedTopics.clear();
+    closed = true;
+    console.log(`[Disconnect] User disconnected: ${(conn as any).user.email}`);
+  });
+
+  conn.on("message", (message: Buffer | string) => {
+    const messageData = JSON.parse(message.toString());
+
+    if (messageData && messageData.type && !closed) {
+      switch (messageData.type) {
+        case "subscribe":
+          (messageData.topics || []).forEach((topicName: string) => {
+            if (typeof topicName === "string") {
+              const topic = map.setIfUndefined(
+                topics,
+                topicName,
+                () => new Set()
+              );
+              topic.add(conn);
+              subscribedTopics.add(topicName);
+              console.log(
+                `[Subscribe] User ${
+                  (conn as any).user.email
+                } subscribed to ${topicName}`
+              );
+            }
+          });
+          break;
+        case "unsubscribe":
+          (messageData.topics || []).forEach((topicName: string) => {
+            const subs = topics.get(topicName);
+            if (subs) {
+              subs.delete(conn);
+            }
+          });
+          break;
+        case "publish": // y-webrtc는 이 이벤트를 시그널링에 사용
+          if (messageData.topic) {
+            const receivers = topics.get(messageData.topic);
+            if (receivers) {
+              // 보낸 사람을 제외한 모든 사람에게 메시지 전송
+              receivers.forEach((receiver) => {
+                if (receiver !== conn) {
+                  send(receiver, messageData);
+                }
+              });
+            }
+          }
+          break;
+        case "ping":
+          send(conn, { type: "pong" });
+      }
+    }
+  });
+});
+
+server.on("upgrade", (request, socket, head) => {
+  // --- ▼▼▼ JWT 인증 로직 추가 ▼▼▼ ---
+  try {
+    const url = new URL(request.url!, `ws://${request.headers.host}`);
+    const token = url.searchParams.get("token");
 
     if (!token) {
-      console.error("[Auth] Connection rejected: No token provided.");
-      return next(new Error("Authentication error: No token provided."));
+      console.error("[Auth] Upgrade rejected: No token provided.");
+      socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+      socket.destroy();
+      return;
     }
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET!) as {
       id: number;
       email: string;
     };
-    socket.data.user = { id: decoded.id, email: decoded.email };
-    next();
-  } catch (err: any) {
-    console.error("[Auth] Connection rejected: Invalid token.", err.message);
-    return next(new Error("Authentication error: Invalid token."));
+
+    // 인증 성공 시, wss.handleUpgrade 호출
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      // ws 객체에 사용자 정보 주입
+      (ws as any).user = decoded;
+      wss.emit("connection", ws, request);
+    });
+  } catch (err) {
+    console.error("[Auth] Upgrade rejected: Invalid token.");
+    socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+    socket.destroy();
+    return;
   }
+  // --- ▲▲▲ JWT 인증 로직 끝 ▲▲▲ ---
 });
 
-// --- 3. Connection 이벤트 핸들러 ---
-io.on("connection", (socket: Socket) => {
-  const user = socket.data.user;
-  console.log(`[Connection] User connected: ${user.email} (ID: ${socket.id})`);
-
-  // --- 4. y-webrtc v13+ 표준 시그널링 이벤트 핸들러들 ---
-
-  socket.on("y-webrtc-join", async (roomName: string) => {
-    socket.join(roomName);
-    console.log(`[Join] User ${user.email} joined room: ${roomName}`);
-
-    // 현재 Room에 있는 다른 소켓들의 ID 목록을 가져옴
-    const otherSockets = await io.in(roomName).fetchSockets();
-    const otherPeerIds = otherSockets
-      .map((s) => s.id)
-      .filter((id) => id !== socket.id);
-
-    // 요청한 클라이언트에게만 기존 피어 목록을 알려줌
-    socket.emit("y-webrtc-joined", { room: roomName, peers: otherPeerIds });
-    console.log(
-      `[Joined] Sent peer list to ${user.email} for room ${roomName}:`,
-      otherPeerIds
-    );
-  });
-
-  socket.on("y-webrtc-signal", ({ to, signal }) => {
-    // 특정 피어에게 시그널링 메시지 전달
-    io.to(to).emit("y-webrtc-signal", { from: socket.id, signal });
-  });
-
-  socket.on("y-webrtc-awareness-update", (payload) => {
-    socket.rooms.forEach((room) => {
-      if (room !== socket.id) {
-        // 자신을 제외한 Room의 다른 모든 피어에게 awareness 정보 브로드캐스트
-        socket
-          .to(room)
-          .emit("y-webrtc-awareness-update", { ...payload, peerId: socket.id });
-      }
-    });
-  });
-
-  socket.on("disconnecting", () => {
-    console.log(
-      `[Disconnecting] User disconnecting: ${user.email} (ID: ${socket.id})`
-    );
-    socket.rooms.forEach((room) => {
-      if (room !== socket.id) {
-        socket.to(room).emit("y-webrtc-left", { room, peerId: socket.id });
-        console.log(
-          `[Left] Notified room ${room} that peer ${socket.id} has left.`
-        );
-      }
-    });
-  });
-
-  socket.on("disconnect", (reason: string) => {
-    console.log(
-      `[Disconnect] User disconnected: ${user.email} (ID: ${socket.id}). Reason: ${reason}`
-    );
-  });
+server.listen(PORT, () => {
+  console.log(
+    `✅ Official y-webrtc Signaling Server listening on port ${PORT}`
+  );
 });
-
-// --- 5. 서버 실행 ---
-const PORT = process.env.PORT || 8081;
-io.listen(Number(PORT));
-console.log(`✅ Flamingo Signaling Server listening on port ${PORT}`);
