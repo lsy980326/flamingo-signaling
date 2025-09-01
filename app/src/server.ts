@@ -157,8 +157,6 @@ server.on("upgrade", (request, socket, head) => {
   // --- ▲▲▲ JWT 인증 로직 끝 ▲▲▲ ---
 });
 
-server.listen(PORT, () => {
-  console.log(
-    `✅ Official y-webrtc Signaling Server listening on port ${PORT}`
-  );
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`✅ Flamingo Signaling Server listening on port ${PORT}`);
 });
