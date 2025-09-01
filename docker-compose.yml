@@ -1,0 +1,36 @@
+version: "3.8"
+services:
+  app:
+    build: ./app
+    container_name: signaling_app
+    restart: always
+    env_file: ./.env
+    networks:
+      - app-network
+
+  nginx:
+    image: nginx:latest
+    container_name: signaling_nginx
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx:/etc/nginx/conf.d
+      - ./certbot/conf:/etc/letsencrypt
+      - ./certbot/www:/var/www/certbot
+    depends_on:
+      - app
+    networks:
+      - app-network
+
+  certbot:
+    image: certbot/certbot
+    container_name: signaling_certbot
+    volumes:
+      - ./certbot/conf:/etc/letsencrypt
+      - ./certbot/www:/var/www/certbot
+
+networks:
+  app-network:
+    driver: bridge
