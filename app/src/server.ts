@@ -11,7 +11,7 @@ const wsReadyStateConnecting = 0;
 const wsReadyStateOpen = 1;
 const pingTimeout = 30000;
 
-const PORT = process.env.PORT || 8081;
+const PORT = parseInt(process.env.PORT || "8081", 10);
 // topics: key는 room 이름(topic), value는 해당 room에 있는 WebSocket 클라이언트 Set
 const topics = new Map<string, Set<WebSocket>>();
 
